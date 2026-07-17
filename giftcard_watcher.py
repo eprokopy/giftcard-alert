@@ -1,49 +1,47 @@
 """
 Gift card watcher for MTS Spotify (payment.mts.ru/tools/spotify)
 --------------------------------------------------------------------------
-Calls the site's own pricing API directly (found via browser dev tools).
-Checks a configurable list of service codes and sends ONE Telegram
-message daily with the current status of each — sold out or available —
-regardless of whether anything changed.
+Uses a real (headless) browser via Playwright to select each country in
+the region dropdown, exactly like a real user would, then reads the
+visible "sold out" marker text on the rendered page. This avoids calling
+the site's protected API directly (which is guarded by anti-fraud tokens
+we can't and shouldn't forge).
+
+Sends ONE Telegram message daily with the current status of each
+configured country, regardless of whether anything changed.
 
 Designed to be run ONCE per invocation by a scheduler (GitHub Actions).
 
 Required environment variables (set as GitHub Actions secrets):
-  BOT_TOKEN     - your Telegram bot token
-  CHAT_ID       - your Telegram chat id
+  BOT_TOKEN  - your Telegram bot token
+  CHAT_ID    - your Telegram chat id
 
-Optional environment variable (set as a GitHub Actions *variable*, not
-secret, so you can update it without touching the code):
-  SERVICE_CODES - comma-separated list, e.g. "480,481,482"
-                  Defaults to 480,481,482 if not set.
+Optional environment variable (set as a GitHub Actions *variable*):
+  COUNTRIES  - comma-separated list of exact option labels as they
+               appear in the dropdown, e.g.:
+               "Польша Польша,США США,Франция Франция,Италия Италия"
+               Defaults to those four if not set.
 """
 
 import os
 import sys
 import json
 import requests
+from playwright.sync_api import sync_playwright
 
-API_URL = "https://api.mtsbank.ru/anonymous/games/getPrice"
-PARTNER = "fwk"
-STATUS_FILE = "status.json"
 PAGE_URL = "https://payment.mts.ru/tools/spotify"
+SOLD_OUT_MARKER = "РАСКУПИЛИ"
+STATUS_FILE = "status.json"
+REGION_BUTTON_NAME = "Выбрать регион"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-SERVICE_CODES = [
-    int(code.strip())
-    for code in os.environ.get("SERVICE_CODES", "480,481,482").split(",")
-    if code.strip()
+DEFAULT_COUNTRIES = "Польша Польша,США США,Франция Франция,Италия Италия"
+COUNTRIES = [
+    c.strip()
+    for c in os.environ.get("COUNTRIES", DEFAULT_COUNTRIES).split(",")
+    if c.strip()
 ]
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Referer": PAGE_URL,
-    "Accept": "application/json",
-}
 
 
 def send_telegram_message(text: str) -> None:
@@ -54,25 +52,22 @@ def send_telegram_message(text: str) -> None:
 
 def read_previous_statuses() -> dict:
     if os.path.exists(STATUS_FILE):
-        with open(STATUS_FILE, "r") as f:
+        with open(STATUS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
 def write_statuses(statuses: dict) -> None:
-    with open(STATUS_FILE, "w") as f:
-        json.dump(statuses, f, indent=2)
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(statuses, f, indent=2, ensure_ascii=False)
 
 
-def check_service_code(code: int) -> tuple[str, str]:
-    """Returns (status, price) for a given serviceCode."""
-    params = {"serviceCode": code, "partner": PARTNER}
-    resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    price = data.get("price", "")
-    status = "available" if price else "sold_out"
-    return status, price
+def check_country_status(page, country_option_name: str) -> str:
+    page.get_by_role("button", name=REGION_BUTTON_NAME).click()
+    page.get_by_role("option", name=country_option_name).click()
+    page.wait_for_timeout(2500)  # let the price/availability data load after selection
+    content = page.content()
+    return "sold_out" if SOLD_OUT_MARKER in content else "available"
 
 
 def main() -> None:
@@ -84,28 +79,34 @@ def main() -> None:
     current = {}
     lines = []
 
-    for code in SERVICE_CODES:
-        code_key = str(code)
-        try:
-            status, price = check_service_code(code)
-        except requests.RequestException as e:
-            print(f"Error checking code {code}: {e}")
-            current[code_key] = previous.get(code_key, "unknown")
-            lines.append(f"Code {code}: check failed ({e})")
-            continue
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(PAGE_URL)
+        page.wait_for_timeout(2000)
 
-        current[code_key] = status
-        prev_status = previous.get(code_key, "unknown")
-        changed = prev_status not in ("unknown", status)
-        print(f"Code {code}: previous={prev_status} current={status} price={price!r}")
+        for country in COUNTRIES:
+            try:
+                status = check_country_status(page, country)
+            except Exception as e:
+                print(f"Error checking {country}: {e}")
+                current[country] = previous.get(country, "unknown")
+                lines.append(f"{country}: check failed ({e})")
+                continue
 
-        if status == "available":
-            line = f"✅ Code {code}: AVAILABLE (price {price})"
-        else:
-            line = f"❌ Code {code}: sold out"
-        if changed:
-            line += "  (changed since last check)"
-        lines.append(line)
+            current[country] = status
+            prev_status = previous.get(country, "unknown")
+            changed = prev_status not in ("unknown", status)
+            print(f"{country}: previous={prev_status} current={status}")
+
+            emoji = "✅" if status == "available" else "❌"
+            label = "AVAILABLE" if status == "available" else "sold out"
+            line = f"{emoji} {country}: {label}"
+            if changed:
+                line += "  (changed since last check)"
+            lines.append(line)
+
+        browser.close()
 
     message = "Daily gift card status:\n" + "\n".join(lines) + f"\n{PAGE_URL}"
     send_telegram_message(message)

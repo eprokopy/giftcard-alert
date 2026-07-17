@@ -21,13 +21,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests
+        run: |
+          pip install requests playwright
+          playwright install --with-deps chromium
 
       - name: Run watcher
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          SERVICE_CODES: ${{ vars.SERVICE_CODES }}
+          COUNTRIES: ${{ vars.COUNTRIES }}
         run: python giftcard_watcher.py
 
       - name: Commit updated status file
