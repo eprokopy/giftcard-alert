@@ -2,11 +2,11 @@ name: Check gift card availability
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # every 3 hours
-  workflow_dispatch: {}      # lets you also trigger it manually from the Actions tab
+    - cron: "0 9 * * *"    # once a day at 09:00 UTC
+  workflow_dispatch: {}     # lets you also trigger it manually from the Actions tab
 
 permissions:
-  contents: write            # needed so the workflow can commit status.txt back
+  contents: write            # needed so the workflow can commit status.json back
 
 jobs:
   check:
@@ -27,13 +27,13 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          SERVICE_CODES: ${{ vars.SERVICE_CODES }}
         run: python giftcard_watcher.py
 
       - name: Commit updated status file
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add status.txt
+          git add status.json
           git diff --quiet --cached || git commit -m "Update status"
           git push
-
